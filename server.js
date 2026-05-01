@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const Anthropic = require('@anthropic-ai/sdk');
 const multer = require('multer');
+const PDFParser = require('pdf2json');
 require('dotenv').config({ path: '../.env' });
 
 const app = express();
@@ -58,15 +59,19 @@ app.post('/generate-questions', async (req, res) => {
 app.post('/parse-cv', upload.single('cv'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'Nessun file caricato' });
-const pdfjsLib = require('pdfjs-dist');    const data = new Uint8Array(req.file.buffer);
-    const doc = await pdfjsLib.getDocument({ data }).promise;
-    let text = '';
-    for (let i = 1; i <= Math.min(doc.numPages, 3); i++) {
-      const page = await doc.getPage(i);
-      const content = await page.getTextContent();
-      text += content.items.map(item => item.str).join(' ') + '\n';
-    }
-    res.json({ text: text.slice(0, 3000) });
+    const pdfParser = new PDFParser();
+    pdfParser.on('pdfParser_dataReady', (data) => {
+      const text = data.Pages
+        .flatMap(page => page.Texts)
+        .map(t => decodeURIComponent(t.R.map(r => r.T).join('')))
+        .join(' ')
+        .slice(0, 3000);
+      res.json({ text });
+    });
+    pdfParser.on('pdfParser_dataError', (err) => {
+      res.status(500).json({ error: err.message });
+    });
+    pdfParser.parseBuffer(req.file.buffer);
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: error.message });
