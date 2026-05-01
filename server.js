@@ -1,12 +1,15 @@
 const express = require('express');
 const cors = require('cors');
 const Anthropic = require('@anthropic-ai/sdk');
+const multer = require('multer');
+const pdfParse = require('pdf-parse');
 require('dotenv').config({ path: '../.env' });
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
+const upload = multer({ storage: multer.memoryStorage() });
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 app.post('/chat', async (req, res) => {
@@ -18,15 +21,12 @@ app.post('/chat', async (req, res) => {
       system,
       messages,
     });
-const text = response.content[0].text
-  .replace(/\*\*/g, '')
-  .replace(/\*/g, '')
-  .replace(/#/g, '')
-  .replace(/---/g, '')
-  .replace(/Prossima domanda/gi, '')
-  .replace(/Feedback sulla risposta precedente/gi, '')
-  .replace(/\n{3,}/g, '\n\n')
-  .trim();    res.json({ content: text });
+    const text = response.content[0].text
+      .replace(/\*\*/g, '').replace(/\*/g, '').replace(/#/g, '')
+      .replace(/---/g, '').replace(/Prossima domanda/gi, '')
+      .replace(/Feedback sulla risposta precedente/gi, '')
+      .replace(/\n{3,}/g, '\n\n').trim();
+    res.json({ content: text });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: error.message });
@@ -35,11 +35,12 @@ const text = response.content[0].text
 
 app.post('/generate-questions', async (req, res) => {
   try {
-    const { role, interviewType, company } = req.body;
+    const { role, interviewType, company, cvText } = req.body;
+    const cvContext = cvText ? `\n\nCV del candidato:\n${cvText.slice(0, 2000)}` : '';
     const response = await client.messages.create({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 1024,
-      system: `Sei un esperto recruiter di ${company || 'una azienda tech'} in ambito sales e fintech. Genera esattamente 5 domande di colloquio in italiano per un candidato che punta al ruolo di "${role}". Tipo: ${interviewType}. Rispondi SOLO con un array JSON valido senza testo aggiuntivo, senza backtick, senza markdown: ["domanda1","domanda2","domanda3","domanda4","domanda5"]`,
+      system: `Sei un esperto recruiter di ${company || 'una azienda tech'} in ambito sales e fintech. Genera esattamente 5 domande di colloquio in italiano per un candidato che punta al ruolo di "${role}". Tipo: ${interviewType}.${cvContext ? ' Personalizza le domande in base al CV del candidato.' : ''} Rispondi SOLO con un array JSON valido senza testo aggiuntivo, senza backtick, senza markdown: ["domanda1","domanda2","domanda3","domanda4","domanda5"]${cvContext}`,
       messages: [{ role: 'user', content: 'Genera le domande.' }],
     });
     let text = response.content[0].text.trim();
@@ -49,6 +50,18 @@ app.post('/generate-questions', async (req, res) => {
     if (start !== -1 && end !== -1) text = text.substring(start, end + 1);
     const questions = JSON.parse(text);
     res.json({ questions });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/parse-cv', upload.single('cv'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'Nessun file caricato' });
+    const data = await pdfParse(req.file.buffer);
+    const text = data.text.slice(0, 3000);
+    res.json({ text });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: error.message });
