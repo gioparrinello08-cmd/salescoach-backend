@@ -1,15 +1,12 @@
 const express = require('express');
 const cors = require('cors');
 const Anthropic = require('@anthropic-ai/sdk');
-const multer = require('multer');
-const pdf = require('pdf-parse');
-const pdfParse = (buffer) => pdf(buffer);require('dotenv').config({ path: '../.env' });
+require('dotenv').config({ path: '../.env' });
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-const upload = multer({ storage: multer.memoryStorage() });
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 app.post('/chat', async (req, res) => {
@@ -50,18 +47,6 @@ app.post('/generate-questions', async (req, res) => {
     if (start !== -1 && end !== -1) text = text.substring(start, end + 1);
     const questions = JSON.parse(text);
     res.json({ questions });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.post('/parse-cv', upload.single('cv'), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: 'Nessun file caricato' });
-    const data = await pdfParse(req.file.buffer);
-    const text = data.text.slice(0, 3000);
-    res.json({ text });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: error.message });
