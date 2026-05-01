@@ -63,7 +63,7 @@ app.post('/parse-cv', upload.single('cv'), async (req, res) => {
     pdfParser.on('pdfParser_dataReady', (data) => {
       const text = data.Pages
         .flatMap(page => page.Texts)
-        .map(t => decodeURIComponent(t.R.map(r => r.T).join('')))
+        .map(t => { try { return decodeURIComponent(t.R.map(r => r.T).join('')); } catch { return t.R.map(r => r.T).join(''); } })
         .join(' ')
         .slice(0, 3000);
       res.json({ text });
