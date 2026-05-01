@@ -2,8 +2,8 @@ const express = require('express');
 const cors = require('cors');
 const Anthropic = require('@anthropic-ai/sdk');
 const multer = require('multer');
-const pdfParse = require('pdf-parse/lib/pdf-parse.js');
-require('dotenv').config({ path: '../.env' });
+const pdf = require('pdf-parse');
+const pdfParse = (buffer) => pdf(buffer);require('dotenv').config({ path: '../.env' });
 
 const app = express();
 app.use(cors());
