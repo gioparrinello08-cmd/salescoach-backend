@@ -110,4 +110,5 @@ Tutti i valori numerici sono interi da 1 a 10.`,
   }
 });
 
-app.listen(3001, () => console.log('Backend running on port 3001'));
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
