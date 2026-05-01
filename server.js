@@ -58,8 +58,7 @@ app.post('/generate-questions', async (req, res) => {
 app.post('/parse-cv', upload.single('cv'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'Nessun file caricato' });
-    const pdfjsLib = require('pdfjs-dist/legacy/build/pdf.js');
-    const data = new Uint8Array(req.file.buffer);
+const pdfjsLib = require('pdfjs-dist');    const data = new Uint8Array(req.file.buffer);
     const doc = await pdfjsLib.getDocument({ data }).promise;
     let text = '';
     for (let i = 1; i <= Math.min(doc.numPages, 3); i++) {
