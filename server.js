@@ -61,12 +61,22 @@ app.post('/parse-cv', upload.single('cv'), async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'Nessun file caricato' });
     const pdfParser = new PDFParser();
     pdfParser.on('pdfParser_dataReady', (data) => {
-      const text = data.Pages
-        .flatMap(page => page.Texts)
-        .map(t => decodeURIComponent(t.R.map(r => r.T).join('')))
-        .join(' ')
-        .slice(0, 3000);
-      res.json({ text });
+      try {
+        const text = data.Pages
+          .flatMap(page => page.Texts)
+          .map(t => {
+            try {
+              return decodeURIComponent(t.R.map(r => r.T).join(''));
+            } catch {
+              return t.R.map(r => r.T).join('');
+            }
+          })
+          .join(' ')
+          .slice(0, 3000);
+        res.json({ text });
+      } catch (err) {
+        res.status(500).json({ error: err.message });
+      }
     });
     pdfParser.on('pdfParser_dataError', (err) => {
       res.status(500).json({ error: err.message });
