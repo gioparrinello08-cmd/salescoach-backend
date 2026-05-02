@@ -17,21 +17,107 @@ const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 app.post('/chat', async (req, res) => {
   try {
-    const { messages, system } = req.body;
+    const {
+      messages,
+      candidateName,
+      candidateRole,
+      cvText,
+      companyName,
+      interviewerName,
+      interviewType,
+      questionTrack,        // array delle 5 domande "guida"
+      currentQuestionIndex, // 0-based, quale domanda della track stiamo affrontando
+      followUpCount,        // quanti follow-up gia' fatti su questa domanda
+    } = req.body;
+
+    const totalQuestions = (questionTrack && questionTrack.length) || 5;
+    const safeIndex = Math.min(Math.max(currentQuestionIndex || 0, 0), totalQuestions - 1);
+    const currentQ = (questionTrack && questionTrack[safeIndex]) || '';
+    const remainingQs = (questionTrack && questionTrack.slice(safeIndex + 1)) || [];
+    const isLastQuestion = safeIndex >= totalQuestions - 1;
+    const fuCount = followUpCount || 0;
+    const maxFollowUpsReached = fuCount >= 2;
+
+    const system = `Sei ${interviewerName || 'un intervistatore esperto'}, recruiter senior di ${companyName || 'una azienda tech'} specializzata in sales e fintech. Stai conducendo un colloquio di tipo "${interviewType || 'HR'}" con ${candidateName || 'il candidato'} che punta al ruolo di ${candidateRole || 'sales'}.${cvText ? `\n\nCV del candidato (estratto):\n${cvText.slice(0, 800)}` : ''}
+
+DOMANDA CORRENTE che stai esplorando (#${safeIndex + 1}/${totalQuestions}):
+"${currentQ}"
+
+${remainingQs.length > 0 ? `Domande successive in programma (NON anticiparle):\n${remainingQs.map((q, i) => `${safeIndex + 2 + i}. ${q}`).join('\n')}` : 'Questa e\' l\'ultima domanda della traccia.'}
+
+REGOLE DI CONDOTTA:
+- Parli in italiano, tono professionale ma umano. Conversazionale, mai robotico.
+- Niente markdown, niente liste puntate, niente titoli. Solo prosa naturale, 2-4 frasi per turno.
+- Reagisci sempre in modo specifico a quello che il candidato ha appena detto: cita un dettaglio, riconosci un punto, mostra che hai ascoltato.
+
+DECISIONE A OGNI TURNO:
+Dopo ogni risposta del candidato, devi decidere UNA di queste tre azioni:
+
+1. FOLLOW_UP - Approfondisci la domanda corrente con una domanda di scavo. Usa quando:
+   - la risposta e' vaga, generica o senza esempi concreti
+   - il candidato ha menzionato qualcosa di interessante che merita approfondimento (un numero, un cliente, una situazione)
+   - manca un elemento chiave (risultato misurabile, contesto, ruolo personale del candidato)
+   ${maxFollowUpsReached ? '- ATTENZIONE: hai gia\' fatto 2 follow-up su questa domanda, NON puoi fare altri follow_up. Passa a NEXT_QUESTION o END.' : `- Hai gia' fatto ${fuCount} follow-up su questa domanda (max 2).`}
+
+2. NEXT_QUESTION - Passa alla prossima domanda della traccia. Usa quando:
+   - la risposta e' soddisfacente e completa
+   - hai gia' scavato abbastanza (2 follow-up max)
+   - ${isLastQuestion ? 'NON disponibile: questa e\' l\'ultima domanda, usa END.' : 'ci sono ancora domande in programma'}
+
+3. END - Concludi il colloquio con un saluto professionale. Usa quando:
+   - ${isLastQuestion ? 'sei sull\'ultima domanda E la risposta e\' soddisfacente o hai gia\' scavato' : 'NON ancora disponibile, ci sono ancora domande'}
+
+FORMATO DI RISPOSTA OBBLIGATORIO:
+Devi rispondere ESATTAMENTE in questo formato, su due righe:
+
+[ACTION: follow_up|next_question|end]
+<la tua battuta naturale al candidato>
+
+Esempi:
+[ACTION: follow_up]
+Interessante che tu abbia chiuso quel deal da 50K. Mi racconti piu' nel dettaglio come hai gestito l'obiezione sul prezzo? Cosa hai detto esattamente?
+
+[ACTION: next_question]
+Capito, hai una struttura chiara sul discovery. Cambiamo argomento: ${remainingQs[0] || ''}
+
+[ACTION: end]
+Bene ${candidateName || ''}, abbiamo coperto tutto quello che mi serviva. Grazie per il tempo, ti faremo sapere nei prossimi giorni. In bocca al lupo.`;
+
     const response = await client.messages.create({
       model: 'claude-haiku-4-5-20251001',
-      max_tokens: 1024,
+      max_tokens: 600,
       system,
       messages,
     });
-    const text = response.content[0].text
-      .replace(/\*\*/g, '').replace(/\*/g, '').replace(/#/g, '')
-      .replace(/---/g, '').replace(/Prossima domanda/gi, '')
-      .replace(/Feedback sulla risposta precedente/gi, '')
-      .replace(/^FEEDBACK:?/gim, '').replace(/^:/gim, '').replace(/\n{3,}/g, '\n\n').trim();
-    res.json({ content: text });
+
+    let raw = response.content[0].text.trim();
+
+    // Parse action tag
+    let action = 'next_question'; // safe default
+    const actionMatch = raw.match(/^\[ACTION:\s*(follow_up|next_question|end)\]/i);
+    if (actionMatch) {
+      action = actionMatch[1].toLowerCase();
+      raw = raw.replace(actionMatch[0], '').trim();
+    }
+
+    // Safety: se il modello dice follow_up ma cap raggiunto, forza avanzamento
+    if (action === 'follow_up' && maxFollowUpsReached) {
+      action = isLastQuestion ? 'end' : 'next_question';
+    }
+    // Safety: se il modello dice next_question sull'ultima domanda, converti in end
+    if (action === 'next_question' && isLastQuestion) {
+      action = 'end';
+    }
+
+    // Cleanup residual markdown / artefatti
+    const text = raw
+      .replace(/\*\*/g, '').replace(/\*/g, '').replace(/^#+\s*/gm, '')
+      .replace(/---/g, '').replace(/^:\s*/gm, '')
+      .replace(/\n{3,}/g, '\n\n').trim();
+
+    res.json({ content: text, action });
   } catch (error) {
-    console.error(error);
+    console.error('CHAT ERROR:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -91,6 +177,7 @@ app.post('/parse-cv', upload.single('cv'), async (req, res) => {
 app.post('/tts', async (req, res) => {
   try {
     const { text } = req.body;
+    if (!text) return res.status(400).json({ error: 'Testo mancante' });
     const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`, {
       method: 'POST',
       headers: {
@@ -103,10 +190,15 @@ app.post('/tts', async (req, res) => {
         voice_settings: { stability: 0.5, similarity_boost: 0.8 },
       }),
     });
+    if (!response.ok) {
+      const errBody = await response.text();
+      return res.status(response.status).json({ error: `ElevenLabs: ${errBody}` });
+    }
     const audioBuffer = await response.arrayBuffer();
     res.setHeader('Content-Type', 'audio/mpeg');
     res.send(Buffer.from(audioBuffer));
   } catch (error) {
+    console.error('TTS ERROR:', error);
     res.status(500).json({ error: error.message });
   }
 });
