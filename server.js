@@ -25,7 +25,7 @@ app.post('/chat', async (req, res) => {
       .replace(/\*\*/g, '').replace(/\*/g, '').replace(/#/g, '')
       .replace(/---/g, '').replace(/Prossima domanda/gi, '')
       .replace(/Feedback sulla risposta precedente/gi, '')
-      .replace(/\n{3,}/g, '\n\n').trim();
+      .replace(/^FEEDBACK:?/gim, '').replace(/^:/gim, '').replace(/\n{3,}/g, '\n\n').trim();
     res.json({ content: text });
   } catch (error) {
     console.error(error);
@@ -63,7 +63,7 @@ app.post('/parse-cv', upload.single('cv'), async (req, res) => {
     pdfParser.on('pdfParser_dataReady', (data) => {
       const text = data.Pages
         .flatMap(page => page.Texts)
-        .map(t => { try { return decodeURIComponent(t.R.map(r => r.T).join('')); } catch { return t.R.map(r => r.T).join(''); } })
+        .map(t => decodeURIComponent(t.R.map(r => r.T).join('')))
         .join(' ')
         .slice(0, 3000);
       res.json({ text });
