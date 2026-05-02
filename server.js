@@ -5,6 +5,9 @@ const multer = require('multer');
 const PDFParser = require('pdf2json');
 require('dotenv').config({ path: '../.env' });
 
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
+const ELEVENLABS_VOICE_ID = 'EXAVITQu4vr4xnSDxMaL';
+
 const app = express();
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'] }));
 app.use(express.json({ limit: '10mb' }));
@@ -65,11 +68,8 @@ app.post('/parse-cv', upload.single('cv'), async (req, res) => {
         const text = data.Pages
           .flatMap(page => page.Texts)
           .map(t => {
-            try {
-              return decodeURIComponent(t.R.map(r => r.T).join(''));
-            } catch {
-              return t.R.map(r => r.T).join('');
-            }
+            try { return decodeURIComponent(t.R.map(r => r.T).join('')); }
+            catch { return t.R.map(r => r.T).join(''); }
           })
           .join(' ')
           .slice(0, 3000);
@@ -84,6 +84,29 @@ app.post('/parse-cv', upload.single('cv'), async (req, res) => {
     pdfParser.parseBuffer(req.file.buffer);
   } catch (error) {
     console.error(error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/tts', async (req, res) => {
+  try {
+    const { text } = req.body;
+    const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`, {
+      method: 'POST',
+      headers: {
+        'xi-api-key': ELEVENLABS_API_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        text: text.slice(0, 500),
+        model_id: 'eleven_multilingual_v2',
+        voice_settings: { stability: 0.5, similarity_boost: 0.8 },
+      }),
+    });
+    const audioBuffer = await response.arrayBuffer();
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.send(Buffer.from(audioBuffer));
+  } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
