@@ -17,6 +17,7 @@
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "multer": "^2.1.1",
+    "openai": "^6.35.0",
     "pdf-parse": "^2.4.5",
     "pdf2json": "^4.0.3",
     "pdfjs-dist": "^5.7.284"
