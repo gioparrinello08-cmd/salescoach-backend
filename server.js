@@ -1,12 +1,10 @@
-// server.js — SalesCoach backend v2
-// Adds: Whisper STT endpoint (/transcribe), greeting flow, improved conversational prompts
+// server.js — SalesCoach backend v2.2
+// Fixes: pdf-parse import bug, more robust error handling on /parse-cv
 
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
 const Anthropic = require('@anthropic-ai/sdk');
-const OpenAI = require('openai');
-const pdfParse = require('pdf-parse');
 
 const app = express();
 app.use(cors());
@@ -15,13 +13,13 @@ app.use(express.json({ limit: '10mb' }));
 const upload = multer({ storage: multer.memoryStorage() });
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const ELEVENLABS_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVENLABS_VOICE_ID = 'EXAVITQu4vr4xnSDxMaL';
+const OPENAI_KEY = process.env.OPENAI_API_KEY;
 
 // ============================================================
-// /tts — ElevenLabs text-to-speech
+// /tts
 // ============================================================
 app.post('/tts', async (req, res) => {
   try {
@@ -60,23 +58,33 @@ app.post('/tts', async (req, res) => {
 });
 
 // ============================================================
-// /transcribe — OpenAI Whisper speech-to-text
+// /transcribe
 // ============================================================
 app.post('/transcribe', upload.single('audio'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'Missing audio file' });
+    if (!OPENAI_KEY) return res.status(500).json({ error: 'OPENAI_API_KEY not configured' });
 
-    const file = await OpenAI.toFile(req.file.buffer, req.file.originalname || 'audio.webm', {
-      type: req.file.mimetype || 'audio/webm',
+    const formData = new FormData();
+    const blob = new Blob([req.file.buffer], { type: req.file.mimetype || 'audio/webm' });
+    formData.append('file', blob, req.file.originalname || 'audio.webm');
+    formData.append('model', 'whisper-1');
+    formData.append('language', 'it');
+
+    const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${OPENAI_KEY}` },
+      body: formData,
     });
 
-    const transcription = await openai.audio.transcriptions.create({
-      file,
-      model: 'whisper-1',
-      language: 'it',
-    });
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error('OpenAI Whisper error:', response.status, errText);
+      return res.status(response.status).json({ error: 'Transcription failed', details: errText });
+    }
 
-    res.json({ text: transcription.text });
+    const data = await response.json();
+    res.json({ text: data.text });
   } catch (error) {
     console.error('Transcribe error:', error);
     res.status(500).json({ error: 'Transcription failed', details: error.message });
@@ -84,21 +92,40 @@ app.post('/transcribe', upload.single('audio'), async (req, res) => {
 });
 
 // ============================================================
-// /parse-cv — extract text from uploaded PDF
+// /parse-cv — FIXED: lazy-load pdf-parse to avoid debug-mode crash
 // ============================================================
+// pdf-parse has a bug where if you require() it at the top level,
+// it tries to load a test PDF from disk that doesn't exist on Railway,
+// crashing the import. Loading it lazily (only when called) avoids this.
 app.post('/parse-cv', upload.single('cv'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'Missing file' });
+
+    // Lazy-load pdf-parse here, not at top of file
+    let pdfParse;
+    try {
+      pdfParse = require('pdf-parse/lib/pdf-parse.js');
+    } catch (e) {
+      console.error('pdf-parse import error:', e);
+      return res.status(500).json({ error: 'PDF parser not available' });
+    }
+
     const data = await pdfParse(req.file.buffer);
+
+    if (!data || !data.text || data.text.trim().length < 10) {
+      return res.json({ text: '', warning: 'Could not extract meaningful text from PDF (might be a scanned image).' });
+    }
+
     res.json({ text: data.text });
   } catch (error) {
     console.error('CV parse error:', error);
-    res.status(500).json({ error: 'CV parse failed' });
+    // Fallback: return empty text instead of 500, so frontend can continue
+    res.json({ text: '', error: error.message });
   }
 });
 
 // ============================================================
-// /generate-questions — pre-generate 5 questions tailored to candidate
+// /generate-questions
 // ============================================================
 app.post('/generate-questions', async (req, res) => {
   try {
@@ -141,7 +168,7 @@ Restituisci SOLO un array JSON di 5 stringhe, niente altro. Esempio:
 });
 
 // ============================================================
-// /chat — main conversational endpoint
+// /chat
 // ============================================================
 app.post('/chat', async (req, res) => {
   try {
@@ -163,7 +190,6 @@ app.post('/chat', async (req, res) => {
     const currentQuestion = questionTrack[currentQuestionIndex] || '';
     const cvSnippet = cvText ? `\n\nCV DEL CANDIDATO (per riferimenti specifici):\n${cvText.slice(0, 2500)}` : '';
 
-    // ============ GREETING MODE ============
     if (isGreeting) {
       const greetingPrompt = `Sei ${interviewerName}, recruiter dell'azienda ${companyName}. Stai iniziando una videochiamata di colloquio con ${candidateName}, candidato per il ruolo di ${candidateRole}.
 
@@ -190,7 +216,6 @@ REGOLE STRETTE:
       return res.json({ content, action: 'greeting' });
     }
 
-    // ============ NORMAL CONVERSATIONAL MODE ============
     const isFirstQuestionAfterGreeting = messages.filter(m => m.role === 'assistant').length === 1;
 
     const systemPrompt = `Sei ${interviewerName}, recruiter dell'azienda ${companyName}. Stai conducendo una videochiamata di colloquio con ${candidateName}, candidato per il ruolo di ${candidateRole}.
@@ -217,7 +242,7 @@ REGOLE DI COMPORTAMENTO:
 DECISIONE — alla fine della tua risposta, decidi cosa fare:
 - Se la risposta del candidato è VAGA, INCOMPLETA o INTERESSANTE da approfondire E hai fatto meno di 2 follow-up → fai un follow-up specifico e termina con: [ACTION: follow_up]
 - Se la risposta è SOLIDA o hai già fatto 2 follow-up → reagisci brevemente E poni la PROSSIMA domanda della lista (${currentQuestionIndex + 2 <= totalQuestions ? `domanda ${currentQuestionIndex + 2}: "${questionTrack[currentQuestionIndex + 1]}"` : 'NESSUNA - colloquio finito'}). Termina con: [ACTION: next_question]
-- Se hai appena posto l'ULTIMA domanda (${currentQuestionIndex + 1} di ${totalQuestions}) e ricevi la risposta finale → reagisci brevemente, ringrazia il candidato, fai un saluto di chiusura naturale tipo "Perfetto Giorgio, abbiamo finito. Grazie davvero del tuo tempo, ti faremo sapere a breve. Buona giornata!" E termina con: [ACTION: end]
+- Se hai appena posto l'ULTIMA domanda (${currentQuestionIndex + 1} di ${totalQuestions}) e ricevi la risposta finale → reagisci brevemente, ringrazia il candidato, fai un saluto di chiusura naturale tipo "Perfetto ${candidateName}, abbiamo finito. Grazie davvero del tuo tempo, ti faremo sapere a breve. Buona giornata!" E termina con: [ACTION: end]
 
 IMPORTANTE: il tag [ACTION: ...] alla fine è OBBLIGATORIO ma non deve apparire nel testo letto al candidato — sarà rimosso dal sistema.`;
 
@@ -258,7 +283,7 @@ IMPORTANTE: il tag [ACTION: ...] alla fine è OBBLIGATORIO ma non deve apparire 
 });
 
 // ============================================================
-// /generate-report — final performance analysis
+// /generate-report
 // ============================================================
 app.post('/generate-report', async (req, res) => {
   try {
@@ -314,10 +339,10 @@ REGOLE:
 // Health check
 // ============================================================
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'SalesCoach backend v2', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', service: 'SalesCoach backend v2.2', timestamp: new Date().toISOString() });
 });
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`SalesCoach backend v2.1 listening on 0.0.0.0:${PORT}`);
+  console.log(`SalesCoach backend v2.2 listening on 0.0.0.0:${PORT}`);
 });
