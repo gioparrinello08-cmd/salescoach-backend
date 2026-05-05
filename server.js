@@ -1,10 +1,11 @@
-// server.js — SalesCoach backend v2.2
-// Fixes: pdf-parse import bug, more robust error handling on /parse-cv
+// server.js — SalesCoach backend v2.3
+// New: real questions database, /analyze-speech endpoint, richer report
 
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
 const Anthropic = require('@anthropic-ai/sdk');
+const QUESTIONS_DB = require('./interview-questions.js');
 
 const app = express();
 app.use(cors());
@@ -58,7 +59,7 @@ app.post('/tts', async (req, res) => {
 });
 
 // ============================================================
-// /transcribe
+// /transcribe (also returns duration for speech analysis)
 // ============================================================
 app.post('/transcribe', upload.single('audio'), async (req, res) => {
   try {
@@ -70,6 +71,8 @@ app.post('/transcribe', upload.single('audio'), async (req, res) => {
     formData.append('file', blob, req.file.originalname || 'audio.webm');
     formData.append('model', 'whisper-1');
     formData.append('language', 'it');
+    // Get verbose_json to also return duration
+    formData.append('response_format', 'verbose_json');
 
     const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
       method: 'POST',
@@ -84,7 +87,10 @@ app.post('/transcribe', upload.single('audio'), async (req, res) => {
     }
 
     const data = await response.json();
-    res.json({ text: data.text });
+    res.json({
+      text: data.text,
+      duration: data.duration || 0, // seconds of audio
+    });
   } catch (error) {
     console.error('Transcribe error:', error);
     res.status(500).json({ error: 'Transcription failed', details: error.message });
@@ -92,16 +98,12 @@ app.post('/transcribe', upload.single('audio'), async (req, res) => {
 });
 
 // ============================================================
-// /parse-cv — FIXED: lazy-load pdf-parse to avoid debug-mode crash
+// /parse-cv
 // ============================================================
-// pdf-parse has a bug where if you require() it at the top level,
-// it tries to load a test PDF from disk that doesn't exist on Railway,
-// crashing the import. Loading it lazily (only when called) avoids this.
 app.post('/parse-cv', upload.single('cv'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'Missing file' });
 
-    // Lazy-load pdf-parse here, not at top of file
     let pdfParse;
     try {
       pdfParse = require('pdf-parse/lib/pdf-parse.js');
@@ -113,54 +115,81 @@ app.post('/parse-cv', upload.single('cv'), async (req, res) => {
     const data = await pdfParse(req.file.buffer);
 
     if (!data || !data.text || data.text.trim().length < 10) {
-      return res.json({ text: '', warning: 'Could not extract meaningful text from PDF (might be a scanned image).' });
+      return res.json({ text: '', warning: 'Could not extract meaningful text from PDF.' });
     }
 
     res.json({ text: data.text });
   } catch (error) {
     console.error('CV parse error:', error);
-    // Fallback: return empty text instead of 500, so frontend can continue
     res.json({ text: '', error: error.message });
   }
 });
 
 // ============================================================
-// /generate-questions
+// /generate-questions — NOW pulls from real questions database
 // ============================================================
 app.post('/generate-questions', async (req, res) => {
   try {
     const { role, interviewType, company, cvText } = req.body;
 
-    const cvSection = cvText
-      ? `\n\nCV DEL CANDIDATO:\n${cvText.slice(0, 3000)}\n\nLe domande devono fare riferimento DIRETTO a esperienze, aziende e numeri presenti nel CV.`
-      : '';
+    // Map company name to DB key
+    const companyKey = (company || '').toLowerCase().includes('salesforce') ? 'salesforce'
+      : (company || '').toLowerCase().includes('google') ? 'google'
+      : (company || '').toLowerCase().includes('revolut') ? 'revolut'
+      : (company || '').toLowerCase().includes('stripe') ? 'stripe'
+      : (company || '').toLowerCase().includes('amazon') ? 'amazon'
+      : 'generic';
 
-    const prompt = `Sei un recruiter senior dell'azienda ${company}. Devi generare 5 domande per un colloquio di tipo "${interviewType}" per il ruolo di "${role}".${cvSection}
+    // Map interview type to DB key
+    const typeKey = (interviewType || '').toLowerCase().includes('hr') ? 'hr'
+      : (interviewType || '').toLowerCase().includes('hiring') ? 'hiring'
+      : (interviewType || '').toLowerCase().includes('role') ? 'roleplay'
+      : 'hr';
 
-REGOLE:
-- Domande in italiano
-- Ogni domanda deve essere realistica, come quelle di un colloquio vero
-- Tono professionale ma cordiale, come una persona vera
-- Mai elenchi puntati o markdown
-- Ogni domanda è UNA frase, max 2 frasi
-- Le domande devono progredire dal generico (introduzione) allo specifico (situazionale/comportamentale)
+    const realQuestions = QUESTIONS_DB[companyKey]?.[typeKey] || QUESTIONS_DB.generic[typeKey];
 
-OUTPUT FORMAT:
-Restituisci SOLO un array JSON di 5 stringhe, niente altro. Esempio:
-["domanda 1", "domanda 2", "domanda 3", "domanda 4", "domanda 5"]`;
+    // Pick 5 random questions from the real pool
+    const shuffled = [...realQuestions].sort(() => Math.random() - 0.5);
+    const picked = shuffled.slice(0, Math.min(5, shuffled.length));
 
-    const response = await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 1500,
-      messages: [{ role: 'user', content: prompt }],
-    });
+    // If we have CV text, ask Claude to lightly adapt 1-2 questions to make them CV-specific
+    if (cvText && cvText.trim().length > 100) {
+      try {
+        const adaptPrompt = `Sei un recruiter senior dell'azienda ${company}. Hai queste 5 domande standard per un colloquio di tipo "${interviewType}" per il ruolo "${role}":
 
-    const text = response.content[0].text.trim();
-    const match = text.match(/\[[\s\S]*\]/);
-    if (!match) return res.json({ questions: [] });
+${picked.map((q, i) => `${i + 1}. ${q}`).join('\n')}
 
-    const questions = JSON.parse(match[0]);
-    res.json({ questions });
+Hai anche il CV del candidato:
+${cvText.slice(0, 2500)}
+
+ADATTAMENTO: scegli LE PRIME 2 domande da personalizzare aggiungendo un riferimento specifico al CV del candidato (azienda, numero, esperienza precisa). Le altre 3 domande LASCIALE INVARIATE perché sono autentiche.
+
+Per le 2 domande adattate, mantieni il senso originale, ma rendile più specifiche al candidato. Esempio:
+- Originale: "Raccontami di un momento in cui hai gestito una pipeline complessa"
+- Adattata: "Nel tuo ruolo ad Amazon hai gestito 2.000+ lead. Come hai prioritizzato le opportunità in pipeline?"
+
+OUTPUT: Restituisci SOLO un array JSON di 5 stringhe, niente altro.`;
+
+        const response = await anthropic.messages.create({
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 1500,
+          messages: [{ role: 'user', content: adaptPrompt }],
+        });
+
+        const text = response.content[0].text.trim();
+        const match = text.match(/\[[\s\S]*\]/);
+        if (match) {
+          const adapted = JSON.parse(match[0]);
+          if (adapted.length === 5) {
+            return res.json({ questions: adapted, source: 'real_db_with_cv_adaptation' });
+          }
+        }
+      } catch (e) {
+        console.error('CV adaptation failed, returning raw questions:', e);
+      }
+    }
+
+    res.json({ questions: picked, source: 'real_db' });
   } catch (error) {
     console.error('Generate questions error:', error);
     res.json({ questions: [] });
@@ -202,7 +231,7 @@ REGOLE STRETTE:
 - Suona come una persona vera che inizia una videocall
 - NON fare ancora domande di colloquio
 - NON usare markdown, elenchi, asterischi
-- Termina con qualcosa che inviti il candidato a rispondere (es. "come va?", "tutto bene?", "pronto?")`;
+- Termina con qualcosa che inviti il candidato a rispondere`;
 
       const response = await anthropic.messages.create({
         model: 'claude-haiku-4-5-20251001',
@@ -235,7 +264,7 @@ REGOLE DI COMPORTAMENTO:
 1. Reagisci sempre alla risposta del candidato in modo specifico (cita qualcosa che ha detto)
 2. Mantieni un tono umano, non robotico — ogni tanto usa intercalari naturali ("ok perfetto", "interessante", "capisco", "bene")
 3. Italiano colloquiale ma professionale
-4. 2-4 frasi totali (sei una persona, non un narratore)
+4. 2-4 frasi totali
 5. MAI markdown, elenchi puntati, asterischi
 6. Sembra una vera conversazione vocale, non un testo scritto
 
@@ -283,20 +312,206 @@ IMPORTANTE: il tag [ACTION: ...] alla fine è OBBLIGATORIO ma non deve apparire 
 });
 
 // ============================================================
-// /generate-report
+// /analyze-speech — NEW — deep analysis of candidate's speech
+// ============================================================
+// Input: array of user responses with their durations (seconds)
+// Output: rich speech analytics
+app.post('/analyze-speech', async (req, res) => {
+  try {
+    const { userResponses = [] } = req.body;
+    // userResponses = [{ text: "...", duration: 12.4 }, ...]
+
+    if (userResponses.length === 0) {
+      return res.json({ error: 'No responses to analyze' });
+    }
+
+    // ---- 1. Compute deterministic metrics (no AI) ----
+
+    const fillers = ['uhm', 'ehm', 'uh', 'eh', 'tipo', 'cioè', 'praticamente', 'diciamo', 'ecco', 'insomma', 'allora', 'in pratica'];
+    const passiveMarkers = ['è stato', 'è stata', 'sono stati', 'sono state', 'è stato fatto', 'è stata fatta', 'venne', 'veniva', 'vengono'];
+    const activeStrong = ['ho gestito', 'ho costruito', 'ho lanciato', 'ho chiuso', 'ho ottenuto', 'ho portato', 'ho creato', 'ho guidato', 'ho coordinato', 'ho raggiunto', 'ho generato', 'ho aumentato', 'ho ridotto', 'ho ottimizzato'];
+
+    let totalWords = 0;
+    let totalDuration = 0;
+    let fillerCount = 0;
+    let passiveCount = 0;
+    let activeCount = 0;
+    let numberMentions = 0;
+    let allWords = [];
+
+    const fillersFound = {};
+    fillers.forEach(f => { fillersFound[f] = 0; });
+
+    userResponses.forEach(r => {
+      const text = (r.text || '').toLowerCase();
+      const duration = r.duration || 0;
+      totalDuration += duration;
+
+      const words = text.match(/\b[\w']+\b/g) || [];
+      totalWords += words.length;
+      allWords = allWords.concat(words);
+
+      // Count fillers (whole word match)
+      fillers.forEach(f => {
+        const regex = new RegExp(`\\b${f}\\b`, 'gi');
+        const matches = (text.match(regex) || []).length;
+        fillerCount += matches;
+        fillersFound[f] += matches;
+      });
+
+      // Count passive structures
+      passiveMarkers.forEach(p => {
+        const regex = new RegExp(`\\b${p}\\b`, 'gi');
+        passiveCount += (text.match(regex) || []).length;
+      });
+
+      // Count strong active verbs
+      activeStrong.forEach(a => {
+        const regex = new RegExp(`\\b${a}\\b`, 'gi');
+        activeCount += (text.match(regex) || []).length;
+      });
+
+      // Count numbers/percentages mentioned (very useful for sales!)
+      const numberMatches = text.match(/\b\d+([.,]\d+)?(%|k|m|mln|mila|mil|euro|€|\$)?\b/gi) || [];
+      numberMentions += numberMatches.length;
+    });
+
+    // Lexical diversity (Type-Token Ratio): unique words / total words
+    const uniqueWords = new Set(allWords).size;
+    const lexicalDiversity = totalWords > 0 ? +(uniqueWords / totalWords).toFixed(3) : 0;
+
+    // Top 5 most repeated content words (skip stopwords)
+    const stopwordsIT = new Set([
+      'il','la','i','le','un','una','uno','di','a','da','in','con','su','per','tra','fra',
+      'e','o','ma','che','non','è','ho','hai','ha','sono','sei','siamo','siete','c\'è',
+      'mi','ti','si','ci','vi','lo','gli','ne',
+      'molto','poi','anche','quando','come','dove','cosa','solo','già','tutto','tutti','sempre',
+      'questo','questa','quello','quella','noi','voi','loro','io','tu','lui','lei',
+    ]);
+    const wordFreq = {};
+    allWords.forEach(w => {
+      const wl = w.toLowerCase();
+      if (wl.length < 4) return;
+      if (stopwordsIT.has(wl)) return;
+      wordFreq[wl] = (wordFreq[wl] || 0) + 1;
+    });
+    const topRepeated = Object.entries(wordFreq)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .filter(([w, c]) => c >= 3); // only if repeated 3+ times
+
+    // Speaking rate: words per minute
+    const wpm = totalDuration > 0 ? Math.round((totalWords / totalDuration) * 60) : 0;
+
+    // Average response duration
+    const avgResponseDuration = userResponses.length > 0
+      ? +(totalDuration / userResponses.length).toFixed(1)
+      : 0;
+
+    // Top 3 fillers actually used
+    const topFillers = Object.entries(fillersFound)
+      .filter(([f, c]) => c > 0)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3);
+
+    // ---- 2. Use Claude for STAR detection (qualitative) ----
+
+    let starDetection = null;
+    try {
+      const transcript = userResponses
+        .map((r, i) => `RISPOSTA ${i + 1}: ${r.text}`)
+        .join('\n\n');
+
+      const starPrompt = `Analizza queste risposte di un candidato a un colloquio. Per ognuna, valuta se segue il metodo STAR (Situation, Task, Action, Result) tipico delle risposte comportamentali ben strutturate.
+
+${transcript}
+
+OUTPUT: Restituisci SOLO un JSON con questa struttura:
+{
+  "star_score": <numero 1-10>,
+  "responses_using_star": <numero di risposte su ${userResponses.length} che seguono STAR>,
+  "comment": "<breve commento di 1 frase>"
+}
+
+REGOLE:
+- "star_score" 1-3: nessuna risposta strutturata, vaga
+- "star_score" 4-6: alcune risposte con cenni di struttura
+- "star_score" 7-10: la maggior parte delle risposte segue STAR
+- Il "comment" deve essere in italiano, 1 frase`;
+
+      const response = await anthropic.messages.create({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 300,
+        messages: [{ role: 'user', content: starPrompt }],
+      });
+
+      const text = response.content[0].text.trim();
+      const match = text.match(/\{[\s\S]*\}/);
+      if (match) {
+        starDetection = JSON.parse(match[0]);
+      }
+    } catch (e) {
+      console.error('STAR detection error:', e);
+    }
+
+    // ---- 3. Build response ----
+
+    const analysis = {
+      total_words: totalWords,
+      total_duration_sec: +totalDuration.toFixed(1),
+      avg_response_duration_sec: avgResponseDuration,
+      words_per_minute: wpm,
+      filler_count: fillerCount,
+      filler_density_pct: totalWords > 0 ? +((fillerCount / totalWords) * 100).toFixed(1) : 0,
+      top_fillers: topFillers.map(([f, c]) => ({ word: f, count: c })),
+      lexical_diversity: lexicalDiversity,
+      top_repeated_words: topRepeated.map(([w, c]) => ({ word: w, count: c })),
+      number_mentions: numberMentions,
+      active_verb_count: activeCount,
+      passive_marker_count: passiveCount,
+      star_detection: starDetection,
+    };
+
+    res.json(analysis);
+  } catch (error) {
+    console.error('Speech analysis error:', error);
+    res.status(500).json({ error: 'Speech analysis failed', details: error.message });
+  }
+});
+
+// ============================================================
+// /generate-report — UPDATED to incorporate speech analysis
 // ============================================================
 app.post('/generate-report', async (req, res) => {
   try {
-    const { messages = [], name = '', role = '' } = req.body;
+    const { messages = [], name = '', role = '', speechAnalysis = null } = req.body;
 
     const transcript = messages
       .map(m => `${m.role === 'assistant' ? 'INTERVISTATORE' : 'CANDIDATO'}: ${m.content}`)
       .join('\n\n');
 
+    const speechSection = speechAnalysis ? `
+
+DATI OGGETTIVI DEL PARLATO (calcolati automaticamente):
+- Parole totali pronunciate: ${speechAnalysis.total_words}
+- Durata media risposta: ${speechAnalysis.avg_response_duration_sec}s (target ottimale: 60-90s)
+- Velocità eloquio: ${speechAnalysis.words_per_minute} parole/minuto (target: 130-160)
+- Riempitivi totali: ${speechAnalysis.filler_count} (densità ${speechAnalysis.filler_density_pct}%)
+- Top riempitivi usati: ${speechAnalysis.top_fillers?.map(f => `"${f.word}" (${f.count}x)`).join(', ') || 'nessuno'}
+- Diversità lessicale: ${speechAnalysis.lexical_diversity} (più alto = vocabolario più ricco)
+- Numeri/dati citati: ${speechAnalysis.number_mentions} (CRUCIALE per ruoli sales)
+- Verbi attivi forti: ${speechAnalysis.active_verb_count}
+- Marker passivi: ${speechAnalysis.passive_marker_count}
+- STAR score: ${speechAnalysis.star_detection?.star_score || 'N/A'}/10
+${speechAnalysis.top_repeated_words?.length > 0 ? `- Parole ripetute eccessivamente: ${speechAnalysis.top_repeated_words.map(w => `"${w.word}" (${w.count}x)`).join(', ')}` : ''}
+
+USA QUESTI DATI per dare feedback SPECIFICO e CONCRETO. Es: se ci sono molti riempitivi, citalo. Se mancano numeri, sottolinealo (è critico per sales).` : '';
+
     const prompt = `Analizza la seguente trascrizione di un colloquio di lavoro e genera un report di valutazione del candidato ${name} (ruolo target: ${role}).
 
 TRASCRIZIONE:
 ${transcript}
+${speechSection}
 
 GENERA UN REPORT JSON con questa struttura ESATTA:
 {
@@ -311,8 +526,8 @@ GENERA UN REPORT JSON con questa struttura ESATTA:
 
 REGOLE:
 - Ogni voto è un intero da 1 a 10
-- 3 punti di forza specifici (cita esempi dalla trascrizione)
-- 3 aree di miglioramento concrete
+- 3 punti di forza specifici (cita esempi dalla trascrizione e/o numeri dei dati parlato)
+- 3 aree di miglioramento concrete (cita riempitivi specifici, mancanza di numeri, struttura debole, ecc.)
 - 1 consiglio finale azionabile (1-2 frasi)
 - Tutto in italiano
 - SOLO JSON, niente altro`;
@@ -328,6 +543,12 @@ REGOLE:
     if (!match) return res.status(500).json({ error: 'Invalid report format' });
 
     const report = JSON.parse(match[0]);
+
+    // Attach the raw speech analysis to the report so the frontend can show graphs
+    if (speechAnalysis) {
+      report.speech = speechAnalysis;
+    }
+
     res.json(report);
   } catch (error) {
     console.error('Report error:', error);
@@ -339,10 +560,10 @@ REGOLE:
 // Health check
 // ============================================================
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'SalesCoach backend v2.2', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', service: 'SalesCoach backend v2.3', timestamp: new Date().toISOString() });
 });
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`SalesCoach backend v2.2 listening on 0.0.0.0:${PORT}`);
+  console.log(`SalesCoach backend v2.3 listening on 0.0.0.0:${PORT}`);
 });
